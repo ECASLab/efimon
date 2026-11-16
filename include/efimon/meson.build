@@ -33,6 +33,9 @@ subdir('logger')
 subdir('perf')
 subdir('ptrace-capstone')
 
+# GPU Specifics
+subdir('gpu')
+
 # Power Specifics
 subdir('power')
 
@@ -46,6 +49,7 @@ subdir('readings')
 lib_headers = lib_iface_headers
 lib_headers += lib_asm_classifier_headers
 lib_headers += lib_logger_headers
+lib_headers += lib_gpu_headers
 lib_headers += lib_perf_headers
 lib_headers += lib_ptrace_capstone_headers
 lib_headers += lib_power_headers
@@ -54,6 +58,7 @@ lib_headers += lib_readings_headers
 
 install_headers(lib_asm_classifier_headers, subdir : 'efimon/asm-classifier')
 install_headers(lib_logger_headers, subdir : 'efimon/logger')
+install_headers(lib_gpu_nvidia_headers, subdir : 'efimon/gpu/nvidia-gpu')
 install_headers(lib_perf_headers, subdir : 'efimon/perf')
 install_headers(lib_ptrace_capstone_headers, subdir : 'efimon/ptrace-capstone')
 install_headers(lib_power_headers, subdir : 'efimon/power')

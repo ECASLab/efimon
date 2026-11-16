@@ -151,6 +151,36 @@ else
   warning('Capstone or ptrace not found. It will disable the ptrace-capstone ASM support')
 endif
 
+# Verify the NVIDIA toolkit (CUDA driver, CUPTI and NVML)
+enable_nvidia_gpu = get_option('enable-nvidia-gpu')
+if enable_nvidia_gpu
+  nvidia_toolkit_root = get_option('nvidia-toolkit-root')
+  nvidia_toolkit_target = get_option('nvidia-toolkit-target')
+  if nvidia_toolkit_target == ''
+    cuda_include_dir = join_paths(nvidia_toolkit_root, 'include')
+    cuda_lib_dir = join_paths(nvidia_toolkit_root, 'lib64')
+    cupti_include_dir = join_paths(nvidia_toolkit_root, 'extras', 'CUPTI', 'include')
+    cupti_lib_dir = join_paths(nvidia_toolkit_root, 'extras', 'CUPTI', 'lib64')
+  else
+    cuda_include_dir = join_paths(nvidia_toolkit_target, 'include')
+    cuda_lib_dir = join_paths(nvidia_toolkit_target, 'lib')
+    cupti_include_dir = cuda_include_dir
+    cupti_lib_dir = cuda_lib_dir
+  endif
+  cuda_stub_lib_dir = join_paths(cuda_lib_dir, 'stubs')
+  cuda_lib_dirs = [cupti_lib_dir, cuda_lib_dir, cuda_stub_lib_dir]
+  nvidia_gpu_deps = [
+    cpp.find_library('cupti', dirs: cuda_lib_dirs, required: true),
+    cpp.find_library('nvidia-ml', dirs: cuda_lib_dirs, required: true),
+    cpp.find_library('cuda', dirs: cuda_lib_dirs, required: true),
+    cpp.find_library('dl', required: true),
+  ]
+  nvidia_gpu_inc = include_directories(cuda_include_dir, cupti_include_dir)
+  message('NVIDIA toolkit found. Enabling the GPU process metrics')
+else
+  message('NVIDIA GPU process metrics disabled')
+endif
+
 project_deps += dependency('threads')
 
 # -----------------------------------------------------------------------------

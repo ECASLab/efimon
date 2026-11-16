@@ -10,6 +10,7 @@ kernel_journal_sources = files('kernel-journal.cpp')
 libnvidia_process_metrics = shared_library('nvidia-process-metrics',
   [
     files('process-metrics.cpp'),
+    files('profiler-utils.cpp'),
     kernel_journal_sources,
   ],
   cpp_args : cpp_args,

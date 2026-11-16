@@ -26,6 +26,7 @@
 #include <ctime>
 #include <deque>
 #include <efimon/gpu/nvidia-gpu/kernel-journal.hpp>
+#include <efimon/gpu/nvidia-gpu/profiler-utils.hpp>
 #include <exception>
 #include <filesystem>  // NOLINT
 #include <fstream>
@@ -41,6 +42,13 @@
 
 /* Kernel names are interned: name_id indexes kernel_names. */
 using KernelEvent = efimon::nvidia::KernelRecord;
+
+using efimon::nvidia::EscapeCsv;
+using efimon::nvidia::FinishCsvFile;
+using efimon::nvidia::NameProfilerThread;
+using efimon::nvidia::PrintCudaError;
+using efimon::nvidia::PrintCuptiError;
+using efimon::nvidia::ThreadCpuMilliseconds;
 
 struct MemcpyEvent {
   uint64_t start;
@@ -408,14 +416,6 @@ static bool GetConfiguredDeviceIndex(int* device_index) {
   return true;
 }
 
-static void PrintCudaError(const char* operation, CUresult result) {
-  const char* name = "CUDA_ERROR_UNKNOWN";
-  const char* message = "unknown CUDA driver error";
-  cuGetErrorName(result, &name);
-  cuGetErrorString(result, &message);
-  std::fprintf(stderr, "[CUDA] %s: %s (%s)\n", operation, name, message);
-}
-
 static bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
   CUresult result = cuInit(0);
   if (result != CUDA_SUCCESS) {
@@ -465,40 +465,6 @@ static bool GetConfiguredWindowDuration(
   }
 
   *window_duration = std::chrono::milliseconds(parsed);
-  return true;
-}
-
-static std::string EscapeCsv(const std::string& value) {
-  std::string escaped = "\"";
-
-  for (const char character : value) {
-    if (character == '\"') escaped += '\"';
-    escaped += character;
-  }
-
-  escaped += "\"";
-  return escaped;
-}
-
-static void PrintCuptiError(const char* operation, CUptiResult result) {
-  const char* message = "unknown CUPTI error";
-  cuptiGetResultString(result, &message);
-  std::fprintf(stderr, "[CUPTI] %s: %s\n", operation, message);
-}
-
-static bool FinishCsvFile(std::ofstream* file,
-                          const std::filesystem::path& path) {
-  file->flush();
-  if (!*file) {
-    std::fprintf(stderr, "[Profiler] Cannot write CSV file %s\n", path.c_str());
-    file->close();
-    return false;
-  }
-  file->close();
-  if (!*file) {
-    std::fprintf(stderr, "[Profiler] Cannot close CSV file %s\n", path.c_str());
-    return false;
-  }
   return true;
 }
 
@@ -849,19 +815,6 @@ static void ReadPowerSamples(PowerSampleReader* reader) {
     reader->last_seen_us =
         std::max(reader->last_seen_us, reader->samples[index].timeStamp);
   }
-}
-
-/* Returns the CPU time used so far by the calling thread, in milliseconds. */
-static double ThreadCpuMilliseconds() {
-  timespec cpu_time{};
-  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_time) != 0) return 0.0;
-  return cpu_time.tv_sec * 1e3 + cpu_time.tv_nsec / 1e6;
-}
-
-/* Names the calling thread so that per-thread CPU tools can tell the
-   profiler's threads from the target's. Names are limited to 15 characters. */
-static void NameProfilerThread(const char* name) {
-  pthread_setname_np(pthread_self(), name);
 }
 
 void SampleGpuMetrics() {

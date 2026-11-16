@@ -7,6 +7,7 @@ lib_gpu_nvidia_headers = []
 if enable_nvidia_gpu
   lib_gpu_nvidia_headers += [
     files('nvidia-gpu/kernel-journal.hpp'),
+    files('nvidia-gpu/profiler-utils.hpp'),
   ]
 endif
 

@@ -26,6 +26,7 @@
 #include <ctime>
 #include <deque>
 #include <efimon/gpu/nvidia-gpu/kernel-journal.hpp>
+#include <efimon/gpu/nvidia-gpu/profiler-options.hpp>
 #include <efimon/gpu/nvidia-gpu/profiler-utils.hpp>
 #include <exception>
 #include <filesystem>  // NOLINT
@@ -43,11 +44,18 @@
 /* Kernel names are interned: name_id indexes kernel_names. */
 using KernelEvent = efimon::nvidia::KernelRecord;
 
+using efimon::nvidia::ConfigureProcessScope;
 using efimon::nvidia::EscapeCsv;
 using efimon::nvidia::FinishCsvFile;
+using efimon::nvidia::GetConfiguredDeviceIndex;
+using efimon::nvidia::GetConfiguredTailDuration;
+using efimon::nvidia::GetConfiguredWindowDuration;
+using efimon::nvidia::kDefaultMetricsWindowMs;
+using efimon::nvidia::LoadProfilerOptions;
 using efimon::nvidia::NameProfilerThread;
 using efimon::nvidia::PrintCudaError;
 using efimon::nvidia::PrintCuptiError;
+using efimon::nvidia::ProfilerOptions;
 using efimon::nvidia::ThreadCpuMilliseconds;
 
 struct MemcpyEvent {
@@ -76,41 +84,6 @@ struct GpuTelemetrySample {
 struct CompletedActivityBuffer {
   uint8_t* buffer;
   size_t valid_size;
-};
-
-/* Runtime switches read from NVIDIA_METRICS_* variables. Every behavior added
-   by the profiler audit can be disabled to compare against the previous one. */
-struct ProfilerOptions {
-  /* Profile child processes too; each writes under children/<pid>. */
-  bool follow_children = false;
-  /* Parse CUPTI buffers in a dedicated thread instead of the CUPTI callback. */
-  bool activity_worker = true;
-  /* Preallocated CUPTI activity buffers; 0 allocates one per request. */
-  size_t activity_pool_buffers = 20;
-  /* CUPTI periodic flush in milliseconds; 0 keeps the CUPTI heuristics. */
-  uint32_t activity_flush_ms = 1000;
-  /* Append kernels to the binary kernel_activity.journal instead of keeping
-     them in memory until exit. */
-  bool kernel_journal = true;
-  /* Write individual memory copies to memcpy_activity.csv. */
-  bool memcpy_csv = true;
-  /* Read the NVML energy counter next to every power sample. */
-  bool nvml_fields = true;
-  /* Bracket only the power and energy reads with the query timestamps. */
-  bool power_bracket = true;
-  /* Write the power samples that the driver buffers to gpu_power_samples.csv.
-   */
-  bool power_samples = true;
-  /* Schedule telemetry reads every 50 ms from a fixed start instead of
-     sleeping 50 ms after each read, which drifts by the read time. */
-  bool fixed_period = true;
-  /* Period of the reads that need not run every 50 ms: the energy counter,
-     temperature, utilization and the driver's power samples. 0 reads them at
-     every telemetry row. */
-  uint32_t slow_read_ms = 200;
-  /* Keep kernels and memory copies of every device, not only of the device
-     whose power NVML reads. */
-  bool all_devices = false;
 };
 
 /* Profiler state is global because the library has no entry point other than
@@ -204,21 +177,12 @@ constexpr char PROFILER_COMPLETION_PARTIAL = '2';
 constexpr auto METRICS_SAMPLE_INTERVAL = std::chrono::milliseconds(50);
 constexpr auto TELEMETRY_FLUSH_INTERVAL = std::chrono::seconds(1);
 
-constexpr int DEFAULT_METRICS_WINDOW_MS = 200;
 static std::chrono::milliseconds metrics_window_duration(
-    DEFAULT_METRICS_WINDOW_MS);
+    kDefaultMetricsWindowMs);
 
 constexpr size_t BUFFER_SIZE = 1024 * 1024;
 constexpr size_t ACTIVITY_BUFFER_ALIGNMENT = 8;
-/* CUPTI holds several buffers at once; on a V100 at 45,000 to 90,000 kernels
-   per second it used up to 18. */
-constexpr size_t DEFAULT_ACTIVITY_POOL_BUFFERS = 20;
-constexpr size_t MAX_ACTIVITY_POOL_BUFFERS = 256;
 constexpr size_t MIN_QUEUED_ACTIVITY_BUFFERS = 2;
-constexpr uint32_t DEFAULT_ACTIVITY_FLUSH_MS = 1000;
-constexpr uint32_t DEFAULT_SLOW_READ_MS = 200;
-constexpr uint32_t MAX_SLOW_READ_MS = 10000;
-constexpr uint64_t MAX_TAIL_MS = 60000;
 /* Telemetry kept after the last kernel at exit, so that the last kernel window
    has real power samples. NVIDIA_METRICS_TAIL_MS sets it; one kernel window by
    default. */
@@ -294,128 +258,6 @@ static void ReportCompletion() {
   profiler_completion_fd = -1;
 }
 
-/* Returns a 0/1 switch, or fallback when the variable is unset or invalid. */
-static bool GetEnvSwitch(const char* name, bool fallback) {
-  const char* configured = std::getenv(name);
-  if (configured == nullptr || configured[0] == '\0') return fallback;
-  if (std::strcmp(configured, "0") == 0) return false;
-  if (std::strcmp(configured, "1") == 0) return true;
-
-  std::fprintf(stderr, "[Profiler] Invalid %s: %s; using %d\n", name,
-               configured, fallback ? 1 : 0);
-  return fallback;
-}
-
-/* Returns a non-negative integer no larger than max_value, or fallback when
-   the variable is unset or invalid. */
-static uint64_t GetEnvInteger(const char* name, uint64_t fallback,
-                              uint64_t max_value) {
-  const char* configured = std::getenv(name);
-  if (configured == nullptr || configured[0] == '\0') return fallback;
-
-  char* end = nullptr;
-  errno = 0;
-  const uint64_t parsed = std::strtoull(configured, &end, 10);
-  if (configured[0] == '-' || errno != 0 || end == configured || *end != '\0' ||
-      parsed > max_value) {
-    std::fprintf(stderr, "[Profiler] Invalid %s: %s; using %" PRIu64 "\n", name,
-                 configured, fallback);
-    return fallback;
-  }
-  return parsed;
-}
-
-static void LoadProfilerOptions() {
-  options.follow_children =
-      GetEnvSwitch("NVIDIA_METRICS_FOLLOW_CHILDREN", false);
-  options.activity_worker =
-      GetEnvSwitch("NVIDIA_METRICS_ACTIVITY_WORKER", true);
-  options.activity_pool_buffers = static_cast<size_t>(
-      GetEnvInteger("NVIDIA_METRICS_ACTIVITY_POOL_BUFFERS",
-                    DEFAULT_ACTIVITY_POOL_BUFFERS, MAX_ACTIVITY_POOL_BUFFERS));
-  options.activity_flush_ms = static_cast<uint32_t>(GetEnvInteger(
-      "NVIDIA_METRICS_ACTIVITY_FLUSH_MS", DEFAULT_ACTIVITY_FLUSH_MS,
-      std::numeric_limits<uint32_t>::max()));
-  options.kernel_journal = GetEnvSwitch("NVIDIA_METRICS_KERNEL_JOURNAL", true);
-  options.memcpy_csv = GetEnvSwitch("NVIDIA_METRICS_MEMCPY_CSV", true);
-  options.nvml_fields = GetEnvSwitch("NVIDIA_METRICS_NVML_FIELDS", true);
-  options.power_bracket = GetEnvSwitch("NVIDIA_METRICS_POWER_BRACKET", true);
-  options.power_samples = GetEnvSwitch("NVIDIA_METRICS_POWER_SAMPLES", true);
-  options.fixed_period = GetEnvSwitch("NVIDIA_METRICS_FIXED_PERIOD", true);
-  options.slow_read_ms = static_cast<uint32_t>(GetEnvInteger(
-      "NVIDIA_METRICS_SLOW_READ_MS", DEFAULT_SLOW_READ_MS, MAX_SLOW_READ_MS));
-  options.all_devices = GetEnvSwitch("NVIDIA_METRICS_ALL_DEVICES", false);
-}
-
-/* Returns the absolute, normalized form of directory, which identifies a
-   profiling session. */
-static std::string SessionDirectory(const std::filesystem::path& directory) {
-  std::error_code error;
-  const std::filesystem::path absolute =
-      std::filesystem::absolute(directory, error);
-  return (error ? directory : absolute).lexically_normal().string();
-}
-
-/* Decides whether this process profiles and where it writes. The first
-   process that loads the library for an output directory owns that session:
-   it records its PID and directory in NVIDIA_METRICS_OWNER_PID and
-   NVIDIA_METRICS_OWNER_OUTPUT_DIR, and exports the absolute directory so that
-   descendants inherit the same session. A wrapper that execs the target keeps
-   the PID and stays the owner. Other processes of the session inherit
-   LD_PRELOAD but stay idle, so that they never overwrite the owner's CSVs,
-   unless NVIDIA_METRICS_FOLLOW_CHILDREN=1 sends them to children/<pid>. A
-   process that asks for a different output directory starts its own session.
-   Returns false when this process must not profile. */
-static bool ConfigureProcessScope() {
-  const char* configured = std::getenv("NVIDIA_METRICS_OUTPUT_DIR");
-  if (configured != nullptr && configured[0] != '\0') {
-    output_directory = configured;
-  }
-
-  const std::string own_pid = std::to_string(getpid());
-  const std::string session_directory = SessionDirectory(output_directory);
-  /* Files opened at start and files written at exit must land in the same
-     directory even if the process changes its working directory. */
-  output_directory = session_directory;
-  const char* owner = std::getenv("NVIDIA_METRICS_OWNER_PID");
-  const char* owner_directory = std::getenv("NVIDIA_METRICS_OWNER_OUTPUT_DIR");
-  if (owner == nullptr || owner[0] == '\0' || owner_directory == nullptr ||
-      session_directory != owner_directory) {
-    setenv("NVIDIA_METRICS_OWNER_PID", own_pid.c_str(), 1);
-    setenv("NVIDIA_METRICS_OWNER_OUTPUT_DIR", session_directory.c_str(), 1);
-    setenv("NVIDIA_METRICS_OUTPUT_DIR", session_directory.c_str(), 1);
-    return true;
-  }
-  if (own_pid == owner) return true;
-
-  if (!options.follow_children) return false;
-  output_directory = output_directory / "children" / own_pid;
-  return true;
-}
-
-static bool GetConfiguredDeviceIndex(int* device_index) {
-  const char* configured = std::getenv("NVIDIA_METRICS_DEVICE");
-
-  if (configured == nullptr || configured[0] == '\0') {
-    *device_index = 0;
-    return true;
-  }
-
-  char* end = nullptr;
-  errno = 0;
-  const int64_t parsed = std::strtoll(configured, &end, 10);
-
-  if (errno != 0 || end == configured || *end != '\0' || parsed < 0 ||
-      parsed > std::numeric_limits<int>::max()) {
-    std::fprintf(stderr, "[Profiler] Invalid NVIDIA_METRICS_DEVICE: %s\n",
-                 configured);
-    return false;
-  }
-
-  *device_index = static_cast<int>(parsed);
-  return true;
-}
-
 static bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
   CUresult result = cuInit(0);
   if (result != CUDA_SUCCESS) {
@@ -438,33 +280,6 @@ static bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
   }
 
   *pci_bus_id = identifier;
-  return true;
-}
-
-static bool GetConfiguredWindowDuration(
-    std::chrono::milliseconds* window_duration) {
-  const char* configured = std::getenv("NVIDIA_METRICS_WINDOW_MS");
-
-  if (configured == nullptr || configured[0] == '\0') {
-    *window_duration = std::chrono::milliseconds(DEFAULT_METRICS_WINDOW_MS);
-    return true;
-  }
-
-  char* end = nullptr;
-  errno = 0;
-  const int64_t parsed = std::strtoll(configured, &end, 10);
-
-  if (errno != 0 || end == configured || *end != '\0' || parsed <= 0 ||
-      parsed > std::numeric_limits<int>::max()) {
-    std::fprintf(
-        stderr,
-        "[Profiler] Invalid NVIDIA_METRICS_WINDOW_MS: %s; using %d ms\n",
-        configured, DEFAULT_METRICS_WINDOW_MS);
-    *window_duration = std::chrono::milliseconds(DEFAULT_METRICS_WINDOW_MS);
-    return false;
-  }
-
-  *window_duration = std::chrono::milliseconds(parsed);
   return true;
 }
 
@@ -1360,8 +1175,10 @@ uint64_t GetProcessMemory(pid_t pid) {
 /* ------------------------------------------------ */
 
 static void ProfilerStart() {
-  LoadProfilerOptions();
-  if (!ConfigureProcessScope()) return;
+  options = LoadProfilerOptions();
+  if (!ConfigureProcessScope(options.follow_children, &output_directory)) {
+    return;
+  }
   profiler_active = true;
   InitializeCompletionChannel();
 
@@ -1370,9 +1187,7 @@ static void ProfilerStart() {
   std::printf("PID: %d\n", getpid());
 
   GetConfiguredWindowDuration(&metrics_window_duration);
-  tail_duration = std::chrono::milliseconds(GetEnvInteger(
-      "NVIDIA_METRICS_TAIL_MS",
-      static_cast<uint64_t>(metrics_window_duration.count()), MAX_TAIL_MS));
+  tail_duration = GetConfiguredTailDuration(metrics_window_duration);
   std::printf("Kernel window: %" PRId64 " ms; final telemetry: %" PRId64
               " ms\n",
               static_cast<int64_t>(metrics_window_duration.count()),

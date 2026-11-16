@@ -3,156 +3,62 @@
  * @brief Preloaded collector for NVML telemetry and CUPTI kernel activity
  *
  * @copyright Copyright (c) 2026. See License for Licensing
+ *
+ * The library is loaded with LD_PRELOAD into the profiled process. Its
+ * load-time constructor starts the profiler and its exit-time destructor
+ * writes the session files; the modules do the work:
+ *
+ * - profiler-options: NVIDIA_METRICS_* settings and the session directory.
+ * - gpu-telemetry: NVML sampling thread and the telemetry CSVs.
+ * - activity-collector: CUPTI kernel and memory copy activity.
+ * - capture-writer: activity CSVs and capture_summary.txt at exit.
  */
 
 #include <cuda.h>
-#include <cupti.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <chrono>
+#include <chrono>  // NOLINT
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <efimon/gpu/nvidia-gpu/activity-collector.hpp>
 #include <efimon/gpu/nvidia-gpu/capture-writer.hpp>
 #include <efimon/gpu/nvidia-gpu/gpu-telemetry.hpp>
 #include <efimon/gpu/nvidia-gpu/kernel-journal.hpp>
 #include <efimon/gpu/nvidia-gpu/profiler-options.hpp>
 #include <efimon/gpu/nvidia-gpu/profiler-utils.hpp>
-#include <exception>
 #include <filesystem>  // NOLINT
-#include <fstream>
 #include <limits>
 #include <string>
-#include <thread>
+#include <system_error>  // NOLINT
+#include <thread>        // NOLINT
 #include <vector>
 
-/* Kernel names are interned: name_id indexes kernel_names. */
-using KernelEvent = efimon::nvidia::KernelRecord;
+namespace efimon {
+namespace nvidia {
+namespace {
 
-using efimon::nvidia::ConfigureProcessScope;
-using efimon::nvidia::EscapeCsv;
-using efimon::nvidia::FinishCsvFile;
-using efimon::nvidia::GetConfiguredDeviceIndex;
-using efimon::nvidia::GetConfiguredTailDuration;
-using efimon::nvidia::GetConfiguredWindowDuration;
-using efimon::nvidia::kDefaultMetricsWindowMs;
-using efimon::nvidia::LoadProfilerOptions;
-using efimon::nvidia::NameProfilerThread;
-using efimon::nvidia::PrintCudaError;
-using efimon::nvidia::PrintCuptiError;
-using efimon::nvidia::ProfilerOptions;
-using efimon::nvidia::ThreadCpuMilliseconds;
+/** Completion byte: the capture is complete */
+constexpr char kCompletionSuccess = '0';
+/** Completion byte: the profiler failed */
+constexpr char kCompletionFailure = '1';
+/** Completion byte: the CSVs were written but lack data; see
+    Profiler::CaptureIsPartial() */
+constexpr char kCompletionPartial = '2';
 
-/* Profiler state is global because the library has no entry point other than
-   its load-time constructor and exit-time destructor. */
-
-/* CUPTI kernel and memory copy activity of the profiled process. */
-static efimon::nvidia::ActivityCollector activity;
-/* NVML device, sampling thread and telemetry CSVs of the measured GPU. */
-static efimon::nvidia::GpuTelemetry telemetry;
-static pid_t profiler_owner_pid = -1;
-/* False in processes that only inherited LD_PRELOAD; see ConfigureProcessScope.
+/**
+ * @brief Gets the PCI bus id of a CUDA device
+ *
+ * @param device_index CUDA device
+ * @param pci_bus_id receives the PCI bus id; must not be nullptr
+ * @return false if the CUDA driver cannot resolve the device
  */
-static bool profiler_active = false;
-static int profiler_completion_fd = -1;
-static std::atomic<bool> profiler_failed{false};
-
-static ProfilerOptions options;
-static std::filesystem::path output_directory(".");
-static bool output_directory_ready = false;
-
-constexpr char PROFILER_COMPLETION_SUCCESS = '0';
-constexpr char PROFILER_COMPLETION_FAILURE = '1';
-/* The CSVs were written but lack data; see CaptureIsPartial(). */
-constexpr char PROFILER_COMPLETION_PARTIAL = '2';
-
-static std::chrono::milliseconds metrics_window_duration(
-    kDefaultMetricsWindowMs);
-
-/* Telemetry kept after the last kernel at exit, so that the last kernel window
-   has real power samples. NVIDIA_METRICS_TAIL_MS sets it; one kernel window by
-   default. */
-static std::chrono::milliseconds tail_duration(0);
-static double tail_wait_ms = 0.0;
-
-static void ProfilerStop();
-
-static void InitializeCompletionChannel() {
-  profiler_owner_pid = getpid();
-  const char* configured = std::getenv("NVIDIA_METRICS_COMPLETION_FD");
-  if (configured == nullptr || configured[0] == '\0') return;
-
-  char* end = nullptr;
-  errno = 0;
-  const int64_t parsed = std::strtoll(configured, &end, 10);
-  unsetenv("NVIDIA_METRICS_COMPLETION_FD");
-  if (errno != 0 || end == configured || *end != '\0' || parsed < 0 ||
-      parsed > std::numeric_limits<int>::max()) {
-    std::fprintf(stderr, "[Profiler] Invalid completion descriptor: %s\n",
-                 configured);
-    return;
-  }
-
-  const int descriptor = static_cast<int>(parsed);
-  const int flags = fcntl(descriptor, F_GETFD);
-  if (flags < 0 || fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) != 0) {
-    std::fprintf(stderr,
-                 "[Profiler] Cannot configure completion descriptor: %s\n",
-                 std::strerror(errno));
-    return;
-  }
-  profiler_completion_fd = descriptor;
-}
-
-/* Returns whether the capture misses data although every file was written:
-   no NVML telemetry, or kernels and memory copies that CUPTI dropped, did not
-   complete or returned after the CSVs started. */
-static bool CaptureIsPartial() {
-  return !telemetry.initialized() || activity.partial();
-}
-
-/* Returns whether the capture failed, in the profiler or in the activity
-   collection. */
-static bool ProfilerFailed() {
-  return profiler_failed.load(std::memory_order_acquire) || activity.failed();
-}
-
-static const char* CaptureStatus() {
-  if (ProfilerFailed()) return "failed";
-  return CaptureIsPartial() ? "partial" : "complete";
-}
-
-static void ReportCompletion() {
-  if (profiler_completion_fd < 0 || getpid() != profiler_owner_pid) return;
-
-  char status = PROFILER_COMPLETION_SUCCESS;
-  if (ProfilerFailed()) {
-    status = PROFILER_COMPLETION_FAILURE;
-  } else if (CaptureIsPartial()) {
-    status = PROFILER_COMPLETION_PARTIAL;
-  }
-  ssize_t written = -1;
-  do {
-    written = write(profiler_completion_fd, &status, sizeof(status));
-  } while (written < 0 && errno == EINTR);
-  if (written != sizeof(status)) {
-    std::fprintf(stderr, "[Profiler] Cannot report completion: %s\n",
-                 written < 0 ? std::strerror(errno) : "short write");
-  }
-  close(profiler_completion_fd);
-  profiler_completion_fd = -1;
-}
-
-static bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
+bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
   CUresult result = cuInit(0);
   if (result != CUDA_SUCCESS) {
     PrintCudaError("Cannot initialize the CUDA driver", result);
@@ -177,79 +83,212 @@ static bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
   return true;
 }
 
+/**
+ * @brief Profiler of the process that loaded the library
+ *
+ * It owns the telemetry and the activity collection of one session. Start()
+ * runs once from the load-time constructor and Stop() once from the
+ * exit-time destructor; the other methods are only called from them.
+ */
+class Profiler {
+ public:
+  /**
+   * @brief Construct a new Profiler object, not started
+   */
+  Profiler() = default;
+
+  Profiler(const Profiler&) = delete;
+  Profiler& operator=(const Profiler&) = delete;
+
+  /**
+   * @brief Reads the settings, opens the session files and starts the
+   * telemetry and the CUPTI activity
+   *
+   * A process that only inherited LD_PRELOAD stays idle.
+   */
+  void Start();
+
+  /**
+   * @brief Stops the collection and writes the session files and summaries
+   *
+   * It does nothing in idle processes and in children that did not exec.
+   */
+  void Stop();
+
+ private:
+  void InitializeCompletionChannel();
+  bool CaptureIsPartial() const;
+  bool Failed() const;
+  const char* CaptureStatus() const;
+  void ReportCompletion();
+  bool PrepareOutputFiles();
+  bool SaveActivityCsvFiles(ActiveTimeWindows* windows, uint64_t* kernel_count);
+  void WriteCaptureSummary(uint64_t kernel_count, double exit_write_cpu_ms,
+                           double exit_write_wall_ms);
+  void PrintProcessSummary(uint64_t kernel_count, uint64_t memory_bytes,
+                           const ActiveTimeWindows& windows) const;
+
+  /** CUPTI kernel and memory copy activity of the profiled process */
+  ActivityCollector activity_;
+  /** NVML device, sampling thread and telemetry CSVs of the measured GPU */
+  GpuTelemetry telemetry_;
+  /** Settings read at start */
+  ProfilerOptions options_;
+  /** Session directory */
+  std::filesystem::path output_directory_{"."};
+  /** True once the session directory exists */
+  bool output_directory_ready_ = false;
+  /** PID of the process that owns the session */
+  pid_t owner_pid_ = -1;
+  /** False in processes that only inherited LD_PRELOAD; see
+      ConfigureProcessScope() */
+  bool active_ = false;
+  /** Descriptor that receives the completion byte; -1 when unused */
+  int completion_fd_ = -1;
+  /** Set when the capture fails outside the activity collection */
+  std::atomic<bool> failed_{false};
+  /** Kernel window */
+  std::chrono::milliseconds window_duration_{kDefaultMetricsWindowMs};
+  /** Telemetry kept after the last kernel at exit, so that the last kernel
+      window has real power samples */
+  std::chrono::milliseconds tail_duration_{0};
+  /** Wall time of that tail */
+  double tail_wait_ms_ = 0.0;
+};
+
+void Profiler::InitializeCompletionChannel() {
+  owner_pid_ = getpid();
+  const char* configured = std::getenv("NVIDIA_METRICS_COMPLETION_FD");
+  if (configured == nullptr || configured[0] == '\0') return;
+
+  char* end = nullptr;
+  errno = 0;
+  const int64_t parsed = std::strtoll(configured, &end, 10);
+  unsetenv("NVIDIA_METRICS_COMPLETION_FD");
+  if (errno != 0 || end == configured || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    std::fprintf(stderr, "[Profiler] Invalid completion descriptor: %s\n",
+                 configured);
+    return;
+  }
+
+  const int descriptor = static_cast<int>(parsed);
+  const int flags = fcntl(descriptor, F_GETFD);
+  if (flags < 0 || fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) != 0) {
+    std::fprintf(stderr,
+                 "[Profiler] Cannot configure completion descriptor: %s\n",
+                 std::strerror(errno));
+    return;
+  }
+  completion_fd_ = descriptor;
+}
+
+/* The capture misses data although every file was written: no NVML
+   telemetry, or kernels and memory copies that CUPTI dropped, did not
+   complete or returned after the CSVs started. */
+bool Profiler::CaptureIsPartial() const {
+  return !telemetry_.initialized() || activity_.partial();
+}
+
+bool Profiler::Failed() const {
+  return failed_.load(std::memory_order_acquire) || activity_.failed();
+}
+
+const char* Profiler::CaptureStatus() const {
+  if (Failed()) return "failed";
+  return CaptureIsPartial() ? "partial" : "complete";
+}
+
+void Profiler::ReportCompletion() {
+  if (completion_fd_ < 0 || getpid() != owner_pid_) return;
+
+  char status = kCompletionSuccess;
+  if (Failed()) {
+    status = kCompletionFailure;
+  } else if (CaptureIsPartial()) {
+    status = kCompletionPartial;
+  }
+  ssize_t written = -1;
+  do {
+    written = write(completion_fd_, &status, sizeof(status));
+  } while (written < 0 && errno == EINTR);
+  if (written != sizeof(status)) {
+    std::fprintf(stderr, "[Profiler] Cannot report completion: %s\n",
+                 written < 0 ? std::strerror(errno) : "short write");
+  }
+  close(completion_fd_);
+  completion_fd_ = -1;
+}
+
 /* Creates the output directory and opens the files that are written while
    the profiled process runs. */
-static bool PrepareOutputFiles() {
+bool Profiler::PrepareOutputFiles() {
   std::error_code error;
-  std::filesystem::create_directories(output_directory, error);
+  std::filesystem::create_directories(output_directory_, error);
   if (error) {
     std::fprintf(stderr, "[Profiler] Cannot create output directory %s: %s\n",
-                 output_directory.c_str(), error.message().c_str());
+                 output_directory_.c_str(), error.message().c_str());
     return false;
   }
-  output_directory_ready = true;
+  output_directory_ready_ = true;
 
-  if (!telemetry.OpenTelemetryFile(output_directory)) return false;
+  if (!telemetry_.OpenTelemetryFile(output_directory_)) return false;
 
-  activity.OpenJournal(profiler_owner_pid);
+  activity_.OpenJournal(owner_pid_);
 
-  telemetry.OpenPowerSamplesFile();
+  telemetry_.OpenPowerSamplesFile();
   return true;
 }
 
 /* Writes the sorted kernel and memory copy CSVs that the analyzers read. */
-static bool SaveActivityCsvFiles(efimon::nvidia::ActiveTimeWindows* windows,
-                                 uint64_t* kernel_count) {
-  if (!output_directory_ready) return false;
+bool Profiler::SaveActivityCsvFiles(ActiveTimeWindows* windows,
+                                    uint64_t* kernel_count) {
+  if (!output_directory_ready_) return false;
 
-  const bool success = efimon::nvidia::WriteActivityCsvFiles(
-      output_directory, profiler_owner_pid, options.memcpy_csv, &activity,
-      windows, kernel_count);
+  const bool success =
+      WriteActivityCsvFiles(output_directory_, owner_pid_, options_.memcpy_csv,
+                            &activity_, windows, kernel_count);
   if (success) {
     std::printf("Timeline CSV: %s\nKernel CSV: %s\n",
-                telemetry.telemetry_path().c_str(),
-                (output_directory / "kernel_activity.csv").c_str());
+                telemetry_.telemetry_path().c_str(),
+                (output_directory_ / "kernel_activity.csv").c_str());
   }
   return success;
 }
 
-/* ------------------------------------------------ */
-/* Library loaded                                   */
-/* ------------------------------------------------ */
-
-static void ProfilerStart() {
-  options = LoadProfilerOptions();
-  if (!ConfigureProcessScope(options.follow_children, &output_directory)) {
+void Profiler::Start() {
+  options_ = LoadProfilerOptions();
+  if (!ConfigureProcessScope(options_.follow_children, &output_directory_)) {
     return;
   }
-  profiler_active = true;
+  active_ = true;
   InitializeCompletionChannel();
 
   std::printf("\n=== NVIDIA Process Profiler ===\n");
 
   std::printf("PID: %d\n", getpid());
 
-  GetConfiguredWindowDuration(&metrics_window_duration);
-  tail_duration = GetConfiguredTailDuration(metrics_window_duration);
+  GetConfiguredWindowDuration(&window_duration_);
+  tail_duration_ = GetConfiguredTailDuration(window_duration_);
   std::printf("Kernel window: %" PRId64 " ms; final telemetry: %" PRId64
               " ms\n",
-              static_cast<int64_t>(metrics_window_duration.count()),
-              static_cast<int64_t>(tail_duration.count()));
+              static_cast<int64_t>(window_duration_.count()),
+              static_cast<int64_t>(tail_duration_.count()));
   std::printf(
       "Options: follow_children=%d activity_worker=%d pool_buffers=%zu "
       "flush_ms=%" PRIu32
       " kernel_journal=%d memcpy_csv=%d nvml_fields=%d "
       "power_bracket=%d power_samples=%d fixed_period=%d "
       "slow_read_ms=%" PRIu32 " all_devices=%d\n",
-      options.follow_children, options.activity_worker,
-      options.activity_pool_buffers, options.activity_flush_ms,
-      options.kernel_journal, options.memcpy_csv, options.nvml_fields,
-      options.power_bracket, options.power_samples, options.fixed_period,
-      options.slow_read_ms, options.all_devices);
+      options_.follow_children, options_.activity_worker,
+      options_.activity_pool_buffers, options_.activity_flush_ms,
+      options_.kernel_journal, options_.memcpy_csv, options_.nvml_fields,
+      options_.power_bracket, options_.power_samples, options_.fixed_period,
+      options_.slow_read_ms, options_.all_devices);
 
-  telemetry.Configure(options);
-  activity.Configure(options, output_directory);
-  if (!PrepareOutputFiles()) profiler_failed = true;
+  telemetry_.Configure(options_);
+  activity_.Configure(options_, output_directory_);
+  if (!PrepareOutputFiles()) failed_ = true;
 
   /* NVML */
 
@@ -258,125 +297,133 @@ static void ProfilerStart() {
   if (GetConfiguredDeviceIndex(&device_index)) {
     std::string pci_bus_id;
     if (GetCudaPciBusId(device_index, &pci_bus_id)) {
-      if (!options.all_devices) activity.set_measured_device(device_index);
-      telemetry.InitializeDevice(device_index, pci_bus_id);
+      if (!options_.all_devices) activity_.set_measured_device(device_index);
+      telemetry_.InitializeDevice(device_index, pci_bus_id);
     }
   }
 
   /* CUPTI */
 
-  switch (activity.Start()) {
-    case efimon::nvidia::ActivityCollector::StartResult::kStarted:
+  switch (activity_.Start()) {
+    case ActivityCollector::StartResult::kStarted:
       break;
-    case efimon::nvidia::ActivityCollector::StartResult::kNotRegistered:
-      profiler_failed = true;
+    case ActivityCollector::StartResult::kNotRegistered:
+      failed_ = true;
       /* NVML telemetry does not depend on CUPTI activity, so keep it. */
       std::printf("\n--- Live GPU telemetry ---\n");
-      telemetry.Start();
+      telemetry_.Start();
       return;
-    case efimon::nvidia::ActivityCollector::StartResult::kNotEnabled:
-      profiler_failed = true;
+    case ActivityCollector::StartResult::kNotEnabled:
+      failed_ = true;
       return;
   }
 
   std::printf("\n--- Live GPU telemetry ---\n");
 
-  telemetry.Start();
+  telemetry_.Start();
 }
-
-/* ------------------------------------------------ */
-/* Profiler shutdown                                */
-/* ------------------------------------------------ */
 
 /* Writes capture_summary.txt with the counters of the capture. */
-static void WriteCaptureSummary(uint64_t kernel_count, double exit_write_cpu_ms,
-                                double exit_write_wall_ms) {
-  if (!output_directory_ready) return;
+void Profiler::WriteCaptureSummary(uint64_t kernel_count,
+                                   double exit_write_cpu_ms,
+                                   double exit_write_wall_ms) {
+  if (!output_directory_ready_) return;
 
-  efimon::nvidia::CaptureSummary summary;
-  summary.pid = profiler_owner_pid;
+  CaptureSummary summary;
+  summary.pid = owner_pid_;
   summary.kernels = kernel_count;
-  summary.distinct_kernel_names = activity.kernel_name_count();
-  summary.memcpy_records = activity.memcpy_events().size();
-  summary.dropped_activity_records = activity.dropped_records();
-  summary.invalid_activity_records = activity.invalid_records();
-  summary.other_device_activity_records = activity.other_device_records();
-  summary.late_activity_records = activity.late_records();
-  summary.activity_buffers_beyond_pool = activity.pool_misses();
-  summary.telemetry_rows = telemetry.rows();
-  summary.power_sample_rows = telemetry.power_sample_rows();
-  summary.kernel_journal = activity.journal_state();
-  summary.telemetry_thread_cpu_ms = telemetry.thread_cpu_ms();
-  summary.activity_thread_cpu_ms = activity.thread_cpu_ms();
+  summary.distinct_kernel_names = activity_.kernel_name_count();
+  summary.memcpy_records = activity_.memcpy_events().size();
+  summary.dropped_activity_records = activity_.dropped_records();
+  summary.invalid_activity_records = activity_.invalid_records();
+  summary.other_device_activity_records = activity_.other_device_records();
+  summary.late_activity_records = activity_.late_records();
+  summary.activity_buffers_beyond_pool = activity_.pool_misses();
+  summary.telemetry_rows = telemetry_.rows();
+  summary.power_sample_rows = telemetry_.power_sample_rows();
+  summary.kernel_journal = activity_.journal_state();
+  summary.telemetry_thread_cpu_ms = telemetry_.thread_cpu_ms();
+  summary.activity_thread_cpu_ms = activity_.thread_cpu_ms();
   summary.exit_write_cpu_ms = exit_write_cpu_ms;
   summary.exit_write_wall_ms = exit_write_wall_ms;
-  summary.tail_wait_ms = tail_wait_ms;
-  summary.profiler_failed = ProfilerFailed();
+  summary.tail_wait_ms = tail_wait_ms_;
+  summary.profiler_failed = Failed();
   summary.capture_status = CaptureStatus();
   if (!efimon::nvidia::WriteCaptureSummary(
-          output_directory / "capture_summary.txt", summary)) {
-    profiler_failed = true;
+          output_directory_ / "capture_summary.txt", summary)) {
+    failed_ = true;
   }
 }
 
-static void ProfilerStop() {
-  if (!profiler_active || getpid() != profiler_owner_pid) return;
+void Profiler::Stop() {
+  if (!active_ || getpid() != owner_pid_) return;
 
-  if (!activity.Stop()) profiler_failed = true;
+  if (!activity_.Stop()) failed_ = true;
 
   /* Keep real power samples beyond the last kernel for a full final window. */
-  if (telemetry.sampling() && tail_duration.count() > 0) {
+  if (telemetry_.sampling() && tail_duration_.count() > 0) {
     const auto tail_start = std::chrono::steady_clock::now();
-    std::this_thread::sleep_for(tail_duration);
-    tail_wait_ms = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - tail_start)
-                       .count();
+    std::this_thread::sleep_for(tail_duration_);
+    tail_wait_ms_ = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tail_start)
+                        .count();
   }
 
-  telemetry.Stop();
-  if (telemetry.failed()) profiler_failed = true;
+  telemetry_.Stop();
+  if (telemetry_.failed()) failed_ = true;
 
-  if (!telemetry.FinishFiles()) profiler_failed = true;
+  if (!telemetry_.FinishFiles()) failed_ = true;
 
-  activity.SortMemcpyEvents();
+  activity_.SortMemcpyEvents();
 
   const uint64_t window_size_ns = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          metrics_window_duration)
+      std::chrono::duration_cast<std::chrono::nanoseconds>(window_duration_)
           .count());
-  efimon::nvidia::ActiveTimeWindows windows(window_size_ns);
+  ActiveTimeWindows windows(window_size_ns);
   uint64_t kernel_count = 0;
   const double exit_cpu_start_ms = ThreadCpuMilliseconds();
   const auto exit_wall_start = std::chrono::steady_clock::now();
   const bool activity_saved = SaveActivityCsvFiles(&windows, &kernel_count);
-  if (!activity_saved) profiler_failed = true;
+  if (!activity_saved) failed_ = true;
   const double exit_write_cpu_ms = ThreadCpuMilliseconds() - exit_cpu_start_ms;
   const double exit_write_wall_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - exit_wall_start)
           .count();
 
-  activity.FinishJournal(activity_saved);
+  activity_.FinishJournal(activity_saved);
 
-  const uint64_t memory_bytes = telemetry.ProcessMemory(getpid());
+  const uint64_t memory_bytes = telemetry_.ProcessMemory(getpid());
 
   WriteCaptureSummary(kernel_count, exit_write_cpu_ms, exit_write_wall_ms);
 
+  PrintProcessSummary(kernel_count, memory_bytes, windows);
+
+  telemetry_.Shutdown();
+
+  std::printf("=======================\n");
+
+  ReportCompletion();
+}
+
+/* Prints the kernel counts, the kernel windows and the memory copies. */
+void Profiler::PrintProcessSummary(uint64_t kernel_count, uint64_t memory_bytes,
+                                   const ActiveTimeWindows& windows) const {
   std::printf("\n--- Process Summary ---\n");
 
   std::printf("PID: %d\n", getpid());
 
   std::printf("Kernels total: %" PRIu64 "\n", kernel_count);
-  std::printf("Distinct kernel names: %zu\n", activity.kernel_name_count());
+  std::printf("Distinct kernel names: %zu\n", activity_.kernel_name_count());
 
-  const size_t dropped = activity.dropped_records();
+  const size_t dropped = activity_.dropped_records();
 
   if (dropped > 0) {
     std::fprintf(stderr, "[CUPTI] WARNING: %zu activity records were dropped\n",
                  dropped);
   }
 
-  const size_t pool_misses = activity.pool_misses();
+  const size_t pool_misses = activity_.pool_misses();
   if (pool_misses > 0) {
     std::printf("Activity buffers allocated beyond the pool: %zu\n",
                 pool_misses);
@@ -384,14 +431,11 @@ static void ProfilerStop() {
 
   std::printf("GPU memory: %.2f MB\n", memory_bytes / (1024.0 * 1024.0));
 
-  /* ---------------------------------------------- */
-  /* Configurable kernel windows                    */
-  /* ---------------------------------------------- */
-
   if (!windows.empty()) {
     std::printf("\n--- %" PRId64 " ms Kernel Windows ---\n",
-                static_cast<int64_t>(metrics_window_duration.count()));
+                static_cast<int64_t>(window_duration_.count()));
 
+    const uint64_t window_size_ns = windows.window_ns();
     const std::vector<uint64_t> active_ns = windows.ActiveNs();
     for (size_t window_number = 0; window_number < active_ns.size();
          ++window_number) {
@@ -409,44 +453,54 @@ static void ProfilerStop() {
     }
   } else {
     std::printf("\nNo kernels captured\n");
-    if (!options.follow_children) {
+    if (!options_.follow_children) {
       std::printf(
           "If the command only starts the CUDA program, set "
           "NVIDIA_METRICS_FOLLOW_CHILDREN=1\n");
     }
   }
 
-  /* ---------------------------------------------- */
-  /* Memory copies                                  */
-  /* ---------------------------------------------- */
-
   std::printf("\n--- Memory copies ---\n");
 
-  std::printf("H2D: %.2f MB\n", activity.bytes_h2d() / (1024.0 * 1024.0));
+  std::printf("H2D: %.2f MB\n", activity_.bytes_h2d() / (1024.0 * 1024.0));
 
-  std::printf("D2H: %.2f MB\n", activity.bytes_d2h() / (1024.0 * 1024.0));
+  std::printf("D2H: %.2f MB\n", activity_.bytes_d2h() / (1024.0 * 1024.0));
 
-  std::printf("D2D: %.2f MB\n", activity.bytes_d2d() / (1024.0 * 1024.0));
-
-  telemetry.Shutdown();
-
-  std::printf("=======================\n");
-
-  ReportCompletion();
+  std::printf("D2D: %.2f MB\n", activity_.bytes_d2d() / (1024.0 * 1024.0));
 }
 
+/**
+ * @brief Starts the profiler when the library loads and stops it at exit
+ *
+ * The profiler is created with new and never destroyed, so CUPTI callbacks
+ * that arrive while the process exits never reach a destroyed object.
+ */
 class ProfilerLifecycle {
  public:
-  ProfilerLifecycle() { ProfilerStart(); }
+  /**
+   * @brief Creates and starts the profiler
+   */
+  ProfilerLifecycle() { profiler_->Start(); }
 
-  ~ProfilerLifecycle() { ProfilerStop(); }
+  /**
+   * @brief Stops the profiler and writes the session files
+   */
+  ~ProfilerLifecycle() { profiler_->Stop(); }
 
   ProfilerLifecycle(const ProfilerLifecycle&) = delete;
   ProfilerLifecycle& operator=(const ProfilerLifecycle&) = delete;
+
+ private:
+  /** Profiler of this process; never deleted */
+  Profiler* const profiler_ = new Profiler;
 };
 
-/* This object must remain after the profiler state declarations in this
-   translation unit. C++ destroys it first, ensuring ProfilerStop() joins the
-   sampling and activity threads before the containers and synchronization
-   objects are destroyed. */
-static ProfilerLifecycle profiler_lifecycle;
+/* The only hook of a preloaded library is a static object: its constructor
+   runs when the library loads and its destructor at exit. This is a
+   deliberate exception to the rule that static objects are trivially
+   destructible; all the state it uses lives in the never-deleted Profiler. */
+ProfilerLifecycle profiler_lifecycle;
+
+} /* namespace */
+} /* namespace nvidia */
+} /* namespace efimon */

@@ -16,3 +16,5 @@ option('enable-perf', type: 'boolean', value: true, description: 'Enable the Lin
 option('enable-sql', type: 'boolean', value: true, description: 'Enable the SQL Logger')
 option('enable-ipmi', type: 'boolean', value: true, description: 'Enable the IPMI Tool')
 option('enable-nvidia-gpu', type: 'boolean', value: false, description: 'Enable the NVIDIA GPU process metrics (CUPTI and NVML)')
+option('nvidia-toolkit-root', type: 'string', value: '/usr/local/cuda', description: 'CUDA toolkit prefix used by the NVIDIA GPU process metrics')
+option('nvidia-toolkit-target', type: 'string', value: '', description: 'CUDA target prefix (for example /usr/local/cuda/targets/sbsa-linux); empty uses the toolkit layout with extras/CUPTI')

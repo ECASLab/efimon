@@ -9,6 +9,7 @@ kernel_journal_sources = files('kernel-journal.cpp')
 # link libefimon and it is always optimized, as in the standalone profiler.
 libnvidia_process_metrics = shared_library('nvidia-process-metrics',
   [
+    files('activity-collector.cpp'),
     files('gpu-telemetry.cpp'),
     files('process-metrics.cpp'),
     files('profiler-options.cpp'),

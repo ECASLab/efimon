@@ -10,6 +10,7 @@ kernel_journal_sources = files('kernel-journal.cpp')
 libnvidia_process_metrics = shared_library('nvidia-process-metrics',
   [
     files('activity-collector.cpp'),
+    files('capture-writer.cpp'),
     files('gpu-telemetry.cpp'),
     files('process-metrics.cpp'),
     files('profiler-options.cpp'),

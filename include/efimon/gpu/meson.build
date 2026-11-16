@@ -7,6 +7,7 @@ lib_gpu_nvidia_headers = []
 if enable_nvidia_gpu
   lib_gpu_nvidia_headers += [
     files('nvidia-gpu/activity-collector.hpp'),
+    files('nvidia-gpu/capture-writer.hpp'),
     files('nvidia-gpu/gpu-telemetry.hpp'),
     files('nvidia-gpu/kernel-journal.hpp'),
     files('nvidia-gpu/profiler-options.hpp'),

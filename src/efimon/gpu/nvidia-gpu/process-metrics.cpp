@@ -22,6 +22,7 @@
 #include <cstring>
 #include <ctime>
 #include <efimon/gpu/nvidia-gpu/activity-collector.hpp>
+#include <efimon/gpu/nvidia-gpu/capture-writer.hpp>
 #include <efimon/gpu/nvidia-gpu/gpu-telemetry.hpp>
 #include <efimon/gpu/nvidia-gpu/kernel-journal.hpp>
 #include <efimon/gpu/nvidia-gpu/profiler-options.hpp>
@@ -29,7 +30,6 @@
 #include <exception>
 #include <filesystem>  // NOLINT
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <string>
 #include <thread>
@@ -83,10 +83,6 @@ static std::chrono::milliseconds metrics_window_duration(
    default. */
 static std::chrono::milliseconds tail_duration(0);
 static double tail_wait_ms = 0.0;
-
-constexpr char KERNEL_CSV_HEADER[] =
-    "event_id,pid,device_id,context_id,stream_id,correlation_id,"
-    "start_ns,end_ns,duration_ns,kernel_name\n";
 
 static void ProfilerStop();
 
@@ -201,113 +197,18 @@ static bool PrepareOutputFiles() {
   return true;
 }
 
-static const char* MemcpyKindName(uint8_t copy_kind) {
-  switch (copy_kind) {
-    case CUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
-      return "HtoD";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
-      return "DtoH";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_HTOA:
-      return "HtoA";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_ATOH:
-      return "AtoH";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_ATOA:
-      return "AtoA";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_ATOD:
-      return "AtoD";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_DTOA:
-      return "DtoA";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_DTOD:
-      return "DtoD";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_HTOH:
-      return "HtoH";
-    case CUPTI_ACTIVITY_MEMCPY_KIND_PTOP:
-      return "PtoP";
-    default:
-      return "unknown";
-  }
-}
-
-/* Writes every kernel to file in start order and adds it to windows: the
-   journal runs merged with the kernels kept in memory. Returns false if the
-   journal cannot be read. */
-static bool WriteSortedKernels(std::ofstream* file,
-                               efimon::nvidia::ActiveTimeWindows* windows,
-                               uint64_t* kernel_count) {
-  /* Rows are formatted with std::to_chars into one buffer and written in
-     large blocks; the text is the same as with stream formatting. */
-  constexpr size_t kCsvBlockBytes = 1 << 20;
-  std::string rows;
-  rows.reserve(kCsvBlockBytes + 512);
-  uint64_t event_id = 0;
-  auto write = [&](const KernelEvent& kernel) {
-    efimon::nvidia::AppendKernelCsvRow(event_id++, profiler_owner_pid, kernel,
-                                       activity.escaped_name(kernel.name_id),
-                                       &rows);
-    windows->Add(kernel.start_ns, kernel.end_ns);
-    if (rows.size() >= kCsvBlockBytes) {
-      file->write(rows.data(), static_cast<std::streamsize>(rows.size()));
-      rows.clear();
-    }
-  };
-
-  const bool journal_read = activity.VisitKernelsSorted(write);
-  file->write(rows.data(), static_cast<std::streamsize>(rows.size()));
-
-  windows->Finish();
-  *kernel_count = event_id;
-  return journal_read;
-}
-
 /* Writes the sorted kernel and memory copy CSVs that the analyzers read. */
 static bool SaveActivityCsvFiles(efimon::nvidia::ActiveTimeWindows* windows,
                                  uint64_t* kernel_count) {
   if (!output_directory_ready) return false;
 
-  bool success = true;
-
-  const auto kernels_path = output_directory / "kernel_activity.csv";
-  std::ofstream kernels_file(kernels_path);
-  if (!kernels_file.is_open()) {
-    std::fprintf(stderr, "[Profiler] Cannot open CSV file %s\n",
-                 kernels_path.c_str());
-    success = false;
-  } else {
-    kernels_file << KERNEL_CSV_HEADER;
-    if (!WriteSortedKernels(&kernels_file, windows, kernel_count)) {
-      success = false;
-    }
-    if (!FinishCsvFile(&kernels_file, kernels_path)) success = false;
-  }
-
-  if (options.memcpy_csv) {
-    const auto memcpy_path = output_directory / "memcpy_activity.csv";
-    std::ofstream memcpy_file(memcpy_path);
-    if (!memcpy_file.is_open()) {
-      std::fprintf(stderr, "[Profiler] Cannot open CSV file %s\n",
-                   memcpy_path.c_str());
-      success = false;
-    } else {
-      memcpy_file << "event_id,pid,device_id,context_id,stream_id,"
-                     "correlation_id,start_ns,end_ns,duration_ns,bytes,"
-                     "copy_kind\n";
-      const auto& memcpy_events = activity.memcpy_events();
-      for (size_t index = 0; index < memcpy_events.size(); ++index) {
-        const auto& copy = memcpy_events[index];
-        memcpy_file << index << ',' << profiler_owner_pid << ','
-                    << copy.device_id << ',' << copy.context_id << ','
-                    << copy.stream_id << ',' << copy.correlation_id << ','
-                    << copy.start << ',' << copy.end << ','
-                    << (copy.end - copy.start) << ',' << copy.bytes << ','
-                    << MemcpyKindName(copy.copy_kind) << '\n';
-      }
-      if (!FinishCsvFile(&memcpy_file, memcpy_path)) success = false;
-    }
-  }
-
+  const bool success = efimon::nvidia::WriteActivityCsvFiles(
+      output_directory, profiler_owner_pid, options.memcpy_csv, &activity,
+      windows, kernel_count);
   if (success) {
     std::printf("Timeline CSV: %s\nKernel CSV: %s\n",
-                telemetry.telemetry_path().c_str(), kernels_path.c_str());
+                telemetry.telemetry_path().c_str(),
+                (output_directory / "kernel_activity.csv").c_str());
   }
   return success;
 }
@@ -387,43 +288,35 @@ static void ProfilerStart() {
 /* Profiler shutdown                                */
 /* ------------------------------------------------ */
 
-/* Writes capture_summary.txt: one key=value per line with the counters that
-   tell whether a capture is complete, plus the CPU time of the profiler's
-   own threads. CUPTI's internal threads are not included. */
+/* Writes capture_summary.txt with the counters of the capture. */
 static void WriteCaptureSummary(uint64_t kernel_count, double exit_write_cpu_ms,
                                 double exit_write_wall_ms) {
   if (!output_directory_ready) return;
 
-  const std::filesystem::path path = output_directory / "capture_summary.txt";
-  std::ofstream summary(path);
-  if (!summary.is_open()) {
-    std::fprintf(stderr, "[Profiler] Cannot open %s\n", path.c_str());
+  efimon::nvidia::CaptureSummary summary;
+  summary.pid = profiler_owner_pid;
+  summary.kernels = kernel_count;
+  summary.distinct_kernel_names = activity.kernel_name_count();
+  summary.memcpy_records = activity.memcpy_events().size();
+  summary.dropped_activity_records = activity.dropped_records();
+  summary.invalid_activity_records = activity.invalid_records();
+  summary.other_device_activity_records = activity.other_device_records();
+  summary.late_activity_records = activity.late_records();
+  summary.activity_buffers_beyond_pool = activity.pool_misses();
+  summary.telemetry_rows = telemetry.rows();
+  summary.power_sample_rows = telemetry.power_sample_rows();
+  summary.kernel_journal = activity.journal_state();
+  summary.telemetry_thread_cpu_ms = telemetry.thread_cpu_ms();
+  summary.activity_thread_cpu_ms = activity.thread_cpu_ms();
+  summary.exit_write_cpu_ms = exit_write_cpu_ms;
+  summary.exit_write_wall_ms = exit_write_wall_ms;
+  summary.tail_wait_ms = tail_wait_ms;
+  summary.profiler_failed = ProfilerFailed();
+  summary.capture_status = CaptureStatus();
+  if (!efimon::nvidia::WriteCaptureSummary(
+          output_directory / "capture_summary.txt", summary)) {
     profiler_failed = true;
-    return;
   }
-
-  summary << "pid=" << profiler_owner_pid << '\n'
-          << "kernels=" << kernel_count << '\n'
-          << "distinct_kernel_names=" << activity.kernel_name_count() << '\n'
-          << "memcpy_records=" << activity.memcpy_events().size() << '\n'
-          << "dropped_activity_records=" << activity.dropped_records() << '\n'
-          << "invalid_activity_records=" << activity.invalid_records() << '\n'
-          << "other_device_activity_records=" << activity.other_device_records()
-          << '\n'
-          << "late_activity_records=" << activity.late_records() << '\n'
-          << "activity_buffers_beyond_pool=" << activity.pool_misses() << '\n'
-          << "telemetry_rows=" << telemetry.rows() << '\n'
-          << "power_sample_rows=" << telemetry.power_sample_rows() << '\n'
-          << "kernel_journal=" << activity.journal_state() << '\n'
-          << std::fixed << std::setprecision(3)
-          << "telemetry_thread_cpu_ms=" << telemetry.thread_cpu_ms() << '\n'
-          << "activity_thread_cpu_ms=" << activity.thread_cpu_ms() << '\n'
-          << "exit_write_cpu_ms=" << exit_write_cpu_ms << '\n'
-          << "exit_write_wall_ms=" << exit_write_wall_ms << '\n'
-          << "tail_wait_ms=" << tail_wait_ms << '\n'
-          << "profiler_failed=" << (ProfilerFailed() ? 1 : 0) << '\n'
-          << "capture_status=" << CaptureStatus() << '\n';
-  if (!FinishCsvFile(&summary, path)) profiler_failed = true;
 }
 
 static void ProfilerStop() {

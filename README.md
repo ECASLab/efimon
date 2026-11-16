@@ -121,6 +121,9 @@ For the `$OPTIONS`, you can select the following:
 | enable-rapl            | true             | [true, false] | Enable the RAPL Interface        |
 | enable-sql             | true             | [true, false] | Enable the SQL Logger            |
 | enable-ipmi            | true             | [true, false] | Enable the IPMI Logger           |
+| enable-nvidia-gpu      | false            | [true, false] | Enable the NVIDIA GPU process metrics (CUPTI and NVML) |
+| nvidia-toolkit-root    | /usr/local/cuda  | path          | CUDA toolkit prefix              |
+| nvidia-toolkit-target  | (empty)          | path          | CUDA target prefix, for example `/usr/local/cuda/targets/sbsa-linux` on Jetson Thor; empty uses `extras/CUPTI` of the toolkit |
 
 ### Testing the installation
 
@@ -199,6 +202,66 @@ It has options to:
 * Enable of disable perf
 
 > The launcher requires a running instance of the EfiMon Daemon
+
+### EfiMon NVIDIA Process Metrics
+
+The NVIDIA process metrics library measures one CUDA process from inside it. It is loaded with `LD_PRELOAD` and records:
+
+* The GPU telemetry from NVML every 50 ms: power, energy, temperature, utilization and graphics clock.
+* Every kernel and memory copy of the process from CUPTI, with CUPTI timestamps, so they can be aligned with the telemetry.
+
+It requires the CUDA toolkit (CUDA driver, CUPTI and NVML) and does not require root. Build it with:
+
+```bash
+meson setup builddir -Denable-nvidia-gpu=true -Dnvidia-toolkit-root=/usr/local/cuda
+ninja -C builddir
+```
+
+On Jetson Thor, add `-Dnvidia-toolkit-target=/usr/local/cuda/targets/sbsa-linux`. The library is installed as `<prefix>/<libdir>/nvidia-process-metrics/libnvidia-process-metrics.so`.
+
+* Example of usage:
+
+```bash
+LIB=builddir/src/efimon/gpu/nvidia-gpu/libnvidia-process-metrics.so
+NVIDIA_METRICS_OUTPUT_DIR=session LD_PRELOAD=${LIB} ./my-cuda-app
+```
+
+When the process exits, the session directory holds:
+
+| File | Content |
+|------|---------|
+| `gpu_telemetry.csv` | One NVML sample every 50 ms, dated with CUPTI timestamps |
+| `gpu_power_samples.csv` | Power samples that the driver buffers, when the GPU provides them |
+| `kernel_activity.csv` | Every kernel in start order: ids, start, end, duration and name |
+| `memcpy_activity.csv` | Every memory copy: start, end, bytes and kind |
+| `capture_summary.txt` | Counters of the capture; `capture_status` is `complete`, `partial` or `failed` |
+
+While the process runs, kernels go to `kernel_activity.journal`, which is deleted once `kernel_activity.csv` is written. If the process is killed, the journal stays and the journal recovery of efimon-analyser turns it into the CSV.
+
+The library reads these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NVIDIA_METRICS_OUTPUT_DIR` | `.` | Session directory |
+| `NVIDIA_METRICS_DEVICE` | 0 | CUDA device whose telemetry and activity are recorded |
+| `NVIDIA_METRICS_WINDOW_MS` | 200 | Kernel window of the console summary |
+| `NVIDIA_METRICS_TAIL_MS` | window | Telemetry kept after the last kernel, up to 60000 |
+| `NVIDIA_METRICS_FOLLOW_CHILDREN` | 0 | Also profile child processes, under `children/<pid>` |
+| `NVIDIA_METRICS_ALL_DEVICES` | 0 | Keep the activity of every device, not only the measured one |
+| `NVIDIA_METRICS_SLOW_READ_MS` | 200 | Period of the energy, temperature and utilization reads; 0 reads them in every row |
+| `NVIDIA_METRICS_MEMCPY_CSV` | 1 | Write `memcpy_activity.csv` |
+| `NVIDIA_METRICS_KERNEL_JOURNAL` | 1 | Write kernels to the journal instead of keeping them in memory |
+| `NVIDIA_METRICS_ACTIVITY_WORKER` | 1 | Parse CUPTI buffers in a dedicated thread |
+| `NVIDIA_METRICS_ACTIVITY_POOL_BUFFERS` | 20 | Preallocated 1 MiB CUPTI buffers, up to 256 |
+| `NVIDIA_METRICS_ACTIVITY_FLUSH_MS` | 1000 | CUPTI periodic flush; 0 keeps the CUPTI heuristics |
+| `NVIDIA_METRICS_NVML_FIELDS` | 1 | Read the NVML energy counter |
+| `NVIDIA_METRICS_POWER_SAMPLES` | 1 | Write `gpu_power_samples.csv` |
+| `NVIDIA_METRICS_POWER_BRACKET` | 1 | Date only the power and energy reads with the CUPTI timestamps |
+| `NVIDIA_METRICS_FIXED_PERIOD` | 1 | Sample every 50 ms from a fixed start, without drift |
+
+> Only one CUPTI client can run in a process: the library cannot be combined with Nsight Systems, Nsight Compute or compute-sanitizer.
+
+The `kernel-journal-testing` example checks the kernel journal; it runs with `meson test -C builddir` when `enable-nvidia-gpu` is set.
 
 ## Platforms
 

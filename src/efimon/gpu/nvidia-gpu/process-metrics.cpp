@@ -7,9 +7,7 @@
 
 #include <cuda.h>
 #include <cupti.h>
-#include <dlfcn.h>
 #include <fcntl.h>
-#include <nvml.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -25,6 +23,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <efimon/gpu/nvidia-gpu/gpu-telemetry.hpp>
 #include <efimon/gpu/nvidia-gpu/kernel-journal.hpp>
 #include <efimon/gpu/nvidia-gpu/profiler-options.hpp>
 #include <efimon/gpu/nvidia-gpu/profiler-utils.hpp>
@@ -34,7 +33,6 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -67,18 +65,6 @@ struct MemcpyEvent {
   uint32_t stream_id;
   uint32_t correlation_id;
   uint8_t copy_kind;
-};
-
-struct GpuTelemetrySample {
-  uint64_t timestamp_ns;
-  uint64_t query_start_ns;
-  uint64_t query_end_ns;
-  std::optional<unsigned int> power_mw;
-  std::optional<unsigned int> temperature_c;
-  std::optional<unsigned int> gpu_utilization;
-  std::optional<unsigned int> memory_utilization;
-  std::optional<unsigned int> graphics_clock_mhz;
-  std::optional<uint64_t> energy_mj;
 };
 
 struct CompletedActivityBuffer {
@@ -120,11 +106,8 @@ static uint64_t bytes_h2d = 0;
 static uint64_t bytes_d2h = 0;
 static uint64_t bytes_d2d = 0;
 
-static nvmlDevice_t device;
-static bool nvml_initialized = false;
-
-static std::atomic<bool> metrics_sampling{false};
-static std::thread* metrics_thread = nullptr;
+/* NVML device, sampling thread and telemetry CSVs of the measured GPU. */
+static efimon::nvidia::GpuTelemetry telemetry;
 static pid_t profiler_owner_pid = -1;
 /* False in processes that only inherited LD_PRELOAD; see ConfigureProcessScope.
  */
@@ -140,20 +123,13 @@ static std::atomic<bool> activity_allocation_error_reported{false};
 static ProfilerOptions options;
 static std::filesystem::path output_directory(".");
 static bool output_directory_ready = false;
-/* Written only by the sampling thread until ProfilerStop() joins it. */
-static std::ofstream telemetry_file;
 /* Kernels of the CUPTI buffer being parsed and the journal that receives
    them, both guarded by activity_mutex. */
 static std::vector<KernelEvent> parsed_kernels;
 static efimon::nvidia::KernelJournal kernel_journal;
-/* Written only by the sampling thread until ProfilerStop() joins it. */
-static std::ofstream power_samples_file;
 
 /* Counters for capture_summary.txt. Each has one writer thread and is read
    after that thread has joined. */
-static uint64_t telemetry_rows = 0;
-static uint64_t power_sample_rows = 0;
-static double telemetry_thread_cpu_ms = 0.0;
 static double activity_thread_cpu_ms = 0.0;
 
 /* Every pooled buffer, and the subset that CUPTI does not currently hold. */
@@ -173,9 +149,6 @@ constexpr char PROFILER_COMPLETION_SUCCESS = '0';
 constexpr char PROFILER_COMPLETION_FAILURE = '1';
 /* The CSVs were written but lack data; see CaptureIsPartial(). */
 constexpr char PROFILER_COMPLETION_PARTIAL = '2';
-
-constexpr auto METRICS_SAMPLE_INTERVAL = std::chrono::milliseconds(50);
-constexpr auto TELEMETRY_FLUSH_INTERVAL = std::chrono::seconds(1);
 
 static std::chrono::milliseconds metrics_window_duration(
     kDefaultMetricsWindowMs);
@@ -226,7 +199,7 @@ static void InitializeCompletionChannel() {
    no NVML telemetry, or kernels and memory copies that CUPTI dropped, did not
    complete or returned after the CSVs started. */
 static bool CaptureIsPartial() {
-  return !nvml_initialized ||
+  return !telemetry.initialized() ||
          dropped_activity_records.load(std::memory_order_relaxed) > 0 ||
          invalid_activity_records.load(std::memory_order_relaxed) > 0 ||
          late_activity_records.load(std::memory_order_relaxed) > 0;
@@ -283,16 +256,8 @@ static bool GetCudaPciBusId(int device_index, std::string* pci_bus_id) {
   return true;
 }
 
-static std::filesystem::path TelemetryPath() {
-  return output_directory / "gpu_telemetry.csv";
-}
-
 static std::filesystem::path KernelJournalPath() {
   return output_directory / "kernel_activity.journal";
-}
-
-static std::filesystem::path PowerSamplesPath() {
-  return output_directory / "gpu_power_samples.csv";
 }
 
 /* Creates the output directory and opens the files that are written while
@@ -307,17 +272,7 @@ static bool PrepareOutputFiles() {
   }
   output_directory_ready = true;
 
-  telemetry_file.open(TelemetryPath());
-  if (!telemetry_file.is_open()) {
-    std::fprintf(stderr, "[Profiler] Cannot open CSV file %s\n",
-                 TelemetryPath().c_str());
-    return false;
-  }
-  telemetry_file
-      << "timestamp_ns,query_start_ns,query_end_ns,power_mw,temperature_c,"
-         "gpu_utilization_pct,"
-         "memory_utilization_pct,graphics_clock_mhz,"
-         "energy_mj\n";
+  if (!telemetry.OpenTelemetryFile(output_directory)) return false;
 
   if (options.kernel_journal &&
       !kernel_journal.Open(KernelJournalPath(), profiler_owner_pid)) {
@@ -328,16 +283,7 @@ static bool PrepareOutputFiles() {
     options.kernel_journal = false;
   }
 
-  if (options.power_samples) {
-    power_samples_file.open(PowerSamplesPath());
-    if (!power_samples_file.is_open()) {
-      std::fprintf(stderr, "[Profiler] Cannot open CSV file %s\n",
-                   PowerSamplesPath().c_str());
-      options.power_samples = false;
-    } else {
-      power_samples_file << "nvml_timestamp_us,timestamp_ns,power_mw\n";
-    }
-  }
+  telemetry.OpenPowerSamplesFile();
   return true;
 }
 
@@ -462,364 +408,10 @@ static bool SaveActivityCsvFiles(efimon::nvidia::ActiveTimeWindows* windows,
   }
 
   if (success) {
-    std::printf("Timeline CSV: %s\nKernel CSV: %s\n", TelemetryPath().c_str(),
-                kernels_path.c_str());
+    std::printf("Timeline CSV: %s\nKernel CSV: %s\n",
+                telemetry.telemetry_path().c_str(), kernels_path.c_str());
   }
   return success;
-}
-
-/* ------------------------------------------------ */
-/* Local NVML sampling                              */
-/* ------------------------------------------------ */
-
-/* Reads the energy counter in millijoules since the driver loaded. A device
-   that does not support it is disabled so that later samples skip the call. */
-static std::optional<uint64_t> ReadEnergyCounter(bool* enabled,
-                                                 bool* error_reported) {
-  if (!*enabled) return std::nullopt;
-
-  unsigned long long energy_mj = 0;  // NOLINT(runtime/int): NVML API type.
-  const nvmlReturn_t result =
-      nvmlDeviceGetTotalEnergyConsumption(device, &energy_mj);
-  if (result == NVML_SUCCESS) return static_cast<uint64_t>(energy_mj);
-
-  if (!*error_reported) {
-    std::fprintf(stderr, "[NVML] Cannot sample total energy: %s\n",
-                 nvmlErrorString(result));
-    *error_reported = true;
-  }
-  if (result == NVML_ERROR_NOT_SUPPORTED) *enabled = false;
-  return std::nullopt;
-}
-
-static void WriteTelemetryRow(const GpuTelemetrySample& sample) {
-  telemetry_file << sample.timestamp_ns << ',' << sample.query_start_ns << ','
-                 << sample.query_end_ns << ',';
-  if (sample.power_mw) telemetry_file << *sample.power_mw;
-  telemetry_file << ',';
-  if (sample.temperature_c) telemetry_file << *sample.temperature_c;
-  telemetry_file << ',';
-  if (sample.gpu_utilization) telemetry_file << *sample.gpu_utilization;
-  telemetry_file << ',';
-  if (sample.memory_utilization) telemetry_file << *sample.memory_utilization;
-  telemetry_file << ',';
-  if (sample.graphics_clock_mhz) telemetry_file << *sample.graphics_clock_mhz;
-  telemetry_file << ',';
-  if (sample.energy_mj) telemetry_file << *sample.energy_mj;
-  telemetry_file << '\n';
-}
-
-/* nvmlDeviceGetTemperature is deprecated in NVML 13. Its replacement,
-   nvmlDeviceGetTemperatureV, is declared from the NVML 12.8 headers on, but
-   the driver provides the symbol, so it is resolved at run time and an older
-   driver keeps using the original call. */
-#ifdef nvmlTemperature_v1
-using NvmlGetTemperatureV = nvmlReturn_t (*)(nvmlDevice_t, nvmlTemperature_t*);
-static NvmlGetTemperatureV nvml_get_temperature_v = nullptr;
-#endif
-
-static void ResolveNvmlTemperatureV() {
-#ifdef nvmlTemperature_v1
-  nvml_get_temperature_v = reinterpret_cast<NvmlGetTemperatureV>(
-      dlsym(RTLD_DEFAULT, "nvmlDeviceGetTemperatureV"));
-#endif
-}
-
-static nvmlReturn_t ReadGpuTemperature(unsigned int* temperature_c) {
-#ifdef nvmlTemperature_v1
-  if (nvml_get_temperature_v != nullptr) {
-    nvmlTemperature_t temperature{};
-    temperature.version = nvmlTemperature_v1;
-    temperature.sensorType = NVML_TEMPERATURE_GPU;
-    const nvmlReturn_t result = nvml_get_temperature_v(device, &temperature);
-    if (result != NVML_SUCCESS) return result;
-    /* The CSV column is unsigned, as with the original call. */
-    if (temperature.temperature < 0) return NVML_ERROR_UNKNOWN;
-    *temperature_c = static_cast<unsigned int>(temperature.temperature);
-    return NVML_SUCCESS;
-  }
-#endif
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  return nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, temperature_c);
-#pragma GCC diagnostic pop
-}
-
-/* State of the reads of the power samples that the driver buffers. */
-struct PowerSampleReader {
-  bool enabled = false;
-  bool error_reported = false;
-  /* NVML timestamps are CPU microseconds since the epoch. */
-  unsigned long long last_seen_us = 0;  // NOLINT(runtime/int): NVML type.
-  std::vector<nvmlSample_t> samples;
-};
-
-static bool SampleValueAsUnsigned(nvmlValueType_t type,
-                                  const nvmlValue_t& value, uint64_t* result) {
-  switch (type) {
-    case NVML_VALUE_TYPE_UNSIGNED_INT:
-      *result = value.uiVal;
-      return true;
-    case NVML_VALUE_TYPE_UNSIGNED_LONG:
-      *result = value.ulVal;
-      return true;
-    case NVML_VALUE_TYPE_UNSIGNED_LONG_LONG:
-      *result = value.ullVal;
-      return true;
-    default:
-      return false;
-  }
-}
-
-/* Sizes the sample buffer and skips the samples taken before the profiler
-   started. A device without power samples disables the reader. */
-static void InitializePowerSamples(PowerSampleReader* reader) {
-  reader->enabled = options.power_samples;
-  if (!reader->enabled) return;
-
-  nvmlValueType_t type{};
-  unsigned int count = 0;
-  const nvmlReturn_t result = nvmlDeviceGetSamples(
-      device, NVML_TOTAL_POWER_SAMPLES, 0, &type, &count, nullptr);
-  if (result != NVML_SUCCESS || count == 0) {
-    std::fprintf(stderr, "[NVML] Cannot read buffered power samples: %s\n",
-                 result != NVML_SUCCESS ? nvmlErrorString(result)
-                                        : "empty sample buffer");
-    reader->enabled = false;
-    return;
-  }
-  reader->samples.resize(count);
-  reader->last_seen_us = static_cast<unsigned long long>(  // NOLINT
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count());
-}
-
-/* Appends the power samples that the driver buffered since the last call. */
-static void ReadPowerSamples(PowerSampleReader* reader) {
-  if (!reader->enabled) return;
-
-  nvmlValueType_t type{};
-  auto count = static_cast<unsigned int>(reader->samples.size());
-  const nvmlReturn_t result = nvmlDeviceGetSamples(
-      device, NVML_TOTAL_POWER_SAMPLES, reader->last_seen_us, &type, &count,
-      reader->samples.data());
-  /* NOT_FOUND means that the driver has no newer sample yet. */
-  if (result == NVML_ERROR_NOT_FOUND) return;
-  if (result != NVML_SUCCESS) {
-    if (!reader->error_reported) {
-      std::fprintf(stderr, "[NVML] Cannot read buffered power samples: %s\n",
-                   nvmlErrorString(result));
-      reader->error_reported = true;
-    }
-    return;
-  }
-
-  for (unsigned int index = 0; index < count; ++index) {
-    const nvmlSample_t& sample = reader->samples[index];
-    uint64_t power_mw = 0;
-    if (sample.timeStamp <= reader->last_seen_us ||
-        !SampleValueAsUnsigned(type, sample.sampleValue, &power_mw)) {
-      continue;
-    }
-    ++power_sample_rows;
-    power_samples_file << sample.timeStamp << ',' << sample.timeStamp * 1000
-                       << ',' << power_mw << '\n';
-  }
-  for (unsigned int index = 0; index < count; ++index) {
-    reader->last_seen_us =
-        std::max(reader->last_seen_us, reader->samples[index].timeStamp);
-  }
-}
-
-void SampleGpuMetrics() {
-  NameProfilerThread("nvpm-telemetry");
-  bool timestamp_error_reported = false;
-  bool power_error_reported = false;
-  bool temperature_error_reported = false;
-  bool utilization_error_reported = false;
-  bool clock_error_reported = false;
-  bool energy_error_reported = false;
-  bool energy_enabled = options.nvml_fields;
-  bool write_error_reported = false;
-  PowerSampleReader power_samples;
-  InitializePowerSamples(&power_samples);
-
-  auto last_flush = std::chrono::steady_clock::now();
-  auto next_sample = last_flush;
-
-  /* On a V100 the energy counter costs as much CPU as the power read, and the
-     other slow reads half as much again. Temperature and utilization, which
-     the driver averages anyway, repeat their last value in the rows between
-     two reads, so every row stays complete; energy is left empty there so
-     that no difference is computed from a stale counter. */
-  const auto slow_read_period = std::chrono::milliseconds(options.slow_read_ms);
-  auto next_slow_read = last_flush;
-  unsigned int temperature_c = 0;
-  nvmlUtilization_t utilization{};
-  nvmlReturn_t temperature_result = NVML_ERROR_UNINITIALIZED;
-  nvmlReturn_t utilization_result = NVML_ERROR_UNINITIALIZED;
-
-  while (true) {
-    unsigned int power_mw = 0;
-    unsigned int graphics_clock_mhz = 0;
-
-    /* The last row after the stop request always reads everything. */
-    const auto poll_time = std::chrono::steady_clock::now();
-    const bool slow_read = options.slow_read_ms == 0 ||
-                           poll_time >= next_slow_read ||
-                           !metrics_sampling.load(std::memory_order_acquire);
-    if (slow_read) next_slow_read = poll_time + slow_read_period;
-
-    uint64_t query_start_ns = 0;
-    uint64_t query_end_ns = 0;
-    CUptiResult timestamp_end_result = CUPTI_SUCCESS;
-
-    const CUptiResult timestamp_start_result =
-        cuptiGetTimestamp(&query_start_ns);
-
-    const nvmlReturn_t power_result =
-        nvmlDeviceGetPowerUsage(device, &power_mw);
-
-    const std::optional<uint64_t> energy_mj =
-        slow_read ? ReadEnergyCounter(&energy_enabled, &energy_error_reported)
-                  : std::nullopt;
-
-    /* The energy model integrates power, so keep the slower driver-averaged
-       counters outside the interval that dates the power sample. */
-    if (options.power_bracket) {
-      timestamp_end_result = cuptiGetTimestamp(&query_end_ns);
-    }
-
-    if (slow_read) {
-      temperature_result = ReadGpuTemperature(&temperature_c);
-      utilization_result = nvmlDeviceGetUtilizationRates(device, &utilization);
-    }
-
-    const nvmlReturn_t clock_result = nvmlDeviceGetClockInfo(
-        device, NVML_CLOCK_GRAPHICS, &graphics_clock_mhz);
-
-    if (!options.power_bracket) {
-      timestamp_end_result = cuptiGetTimestamp(&query_end_ns);
-    }
-
-    /* The driver keeps over two seconds of samples, so reading them at the
-       slow period loses none. */
-    if (slow_read) ReadPowerSamples(&power_samples);
-
-    if (power_result != NVML_SUCCESS && !power_error_reported) {
-      std::fprintf(stderr, "[NVML] Cannot sample power: %s\n",
-                   nvmlErrorString(power_result));
-      power_error_reported = true;
-    }
-    if (temperature_result != NVML_SUCCESS && !temperature_error_reported) {
-      std::fprintf(stderr, "[NVML] Cannot sample temperature: %s\n",
-                   nvmlErrorString(temperature_result));
-      temperature_error_reported = true;
-    }
-    if (utilization_result != NVML_SUCCESS && !utilization_error_reported) {
-      std::fprintf(stderr, "[NVML] Cannot sample utilization: %s\n",
-                   nvmlErrorString(utilization_result));
-      utilization_error_reported = true;
-    }
-    if (clock_result != NVML_SUCCESS && !clock_error_reported) {
-      std::fprintf(stderr, "[NVML] Cannot sample graphics clock: %s\n",
-                   nvmlErrorString(clock_result));
-      clock_error_reported = true;
-    }
-
-    if (timestamp_start_result == CUPTI_SUCCESS &&
-        timestamp_end_result == CUPTI_SUCCESS) {
-      const uint64_t timestamp_ns =
-          query_start_ns + (query_end_ns - query_start_ns) / 2;
-
-      ++telemetry_rows;
-      WriteTelemetryRow({timestamp_ns, query_start_ns, query_end_ns,
-                         power_result == NVML_SUCCESS
-                             ? std::optional<unsigned int>(power_mw)
-                             : std::nullopt,
-                         temperature_result == NVML_SUCCESS
-                             ? std::optional<unsigned int>(temperature_c)
-                             : std::nullopt,
-                         utilization_result == NVML_SUCCESS
-                             ? std::optional<unsigned int>(utilization.gpu)
-                             : std::nullopt,
-                         utilization_result == NVML_SUCCESS
-                             ? std::optional<unsigned int>(utilization.memory)
-                             : std::nullopt,
-                         clock_result == NVML_SUCCESS
-                             ? std::optional<unsigned int>(graphics_clock_mhz)
-                             : std::nullopt,
-                         energy_mj});
-
-    } else if (!timestamp_error_reported) {
-      if (timestamp_start_result != CUPTI_SUCCESS)
-        PrintCuptiError("Cannot timestamp the start of an NVML query",
-                        timestamp_start_result);
-      if (timestamp_end_result != CUPTI_SUCCESS)
-        PrintCuptiError("Cannot timestamp the end of an NVML query",
-                        timestamp_end_result);
-      timestamp_error_reported = true;
-    }
-
-    /* Flush periodically so that an abnormal exit keeps the samples so far. */
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last_flush >= TELEMETRY_FLUSH_INTERVAL) {
-      telemetry_file.flush();
-      if (power_samples.enabled) power_samples_file.flush();
-      last_flush = now;
-    }
-    if (!telemetry_file && !write_error_reported) {
-      std::fprintf(stderr, "[Profiler] Cannot write CSV file %s\n",
-                   TelemetryPath().c_str());
-      profiler_failed.store(true, std::memory_order_release);
-      write_error_reported = true;
-    }
-
-    /* Take one final sample after the stop request to bracket the tail. */
-    if (!metrics_sampling.load(std::memory_order_acquire)) break;
-
-    if (options.fixed_period) {
-      /* Skip the slots missed by a slow read instead of sampling in a burst. */
-      const auto now = std::chrono::steady_clock::now();
-      do {
-        next_sample += METRICS_SAMPLE_INTERVAL;
-      } while (next_sample <= now);
-      std::this_thread::sleep_until(next_sample);
-    } else {
-      std::this_thread::sleep_for(METRICS_SAMPLE_INTERVAL);
-    }
-  }
-  telemetry_thread_cpu_ms = ThreadCpuMilliseconds();
-}
-
-void StartGpuMetricsSampling() {
-  if (!nvml_initialized || !telemetry_file.is_open() ||
-      metrics_thread != nullptr) {
-    return;
-  }
-
-  metrics_sampling.store(true, std::memory_order_release);
-
-  try {
-    metrics_thread = new std::thread(SampleGpuMetrics);
-  } catch (const std::exception& error) {
-    metrics_sampling.store(false, std::memory_order_release);
-
-    std::fprintf(stderr, "[NVML] Failed to start local sampling: %s\n",
-                 error.what());
-  }
-}
-
-void StopGpuMetricsSampling() {
-  metrics_sampling.store(false, std::memory_order_release);
-
-  if (metrics_thread == nullptr) return;
-
-  if (metrics_thread->joinable()) metrics_thread->join();
-
-  delete metrics_thread;
-  metrics_thread = nullptr;
 }
 
 /* ------------------------------------------------ */
@@ -1137,40 +729,6 @@ void CUPTIAPI BufferCompleted(CUcontext context, uint32_t stream_id,
 }
 
 /* ------------------------------------------------ */
-/* NVML process memory                              */
-/* ------------------------------------------------ */
-
-uint64_t GetProcessMemory(pid_t pid) {
-  if (!nvml_initialized) return 0;
-
-  unsigned int count = 0;
-
-  nvmlReturn_t res =
-      nvmlDeviceGetComputeRunningProcesses_v3(device, &count, nullptr);
-
-  if (NVML_ERROR_INSUFFICIENT_SIZE != res && NVML_SUCCESS != res) {
-    return 0;
-  }
-
-  if (count == 0) return 0;
-
-  std::vector<nvmlProcessInfo_t> processes(count);
-
-  res =
-      nvmlDeviceGetComputeRunningProcesses_v3(device, &count, processes.data());
-
-  if (NVML_SUCCESS != res) return 0;
-
-  for (const auto& process : processes) {
-    if (process.pid == static_cast<unsigned int>(pid)) {
-      return process.usedGpuMemory;
-    }
-  }
-
-  return 0;
-}
-
-/* ------------------------------------------------ */
 /* Library loaded                                   */
 /* ------------------------------------------------ */
 
@@ -1204,6 +762,7 @@ static void ProfilerStart() {
       options.power_bracket, options.power_samples, options.fixed_period,
       options.slow_read_ms, options.all_devices);
 
+  telemetry.Configure(options);
   if (!PrepareOutputFiles()) profiler_failed = true;
 
   /* NVML */
@@ -1214,26 +773,7 @@ static void ProfilerStart() {
     std::string pci_bus_id;
     if (GetCudaPciBusId(device_index, &pci_bus_id)) {
       if (!options.all_devices) measured_device_id = device_index;
-      nvmlReturn_t res = nvmlInit_v2();
-
-      if (NVML_SUCCESS == res) {
-        res = nvmlDeviceGetHandleByPciBusId_v2(pci_bus_id.c_str(), &device);
-
-        if (NVML_SUCCESS == res) {
-          nvml_initialized = true;
-          ResolveNvmlTemperatureV();
-          std::printf("CUDA device: %d; NVML PCI device: %s\n", device_index,
-                      pci_bus_id.c_str());
-        } else {
-          std::fprintf(stderr,
-                       "[NVML] Cannot match CUDA device %d at PCI bus %s: %s\n",
-                       device_index, pci_bus_id.c_str(), nvmlErrorString(res));
-          nvmlShutdown();
-        }
-      } else {
-        std::fprintf(stderr, "[NVML] Cannot initialize NVML: %s\n",
-                     nvmlErrorString(res));
-      }
+      telemetry.InitializeDevice(device_index, pci_bus_id);
     }
   }
 
@@ -1254,7 +794,7 @@ static void ProfilerStart() {
     profiler_failed = true;
     /* NVML telemetry does not depend on CUPTI activity, so keep it. */
     std::printf("\n--- Live GPU telemetry ---\n");
-    StartGpuMetricsSampling();
+    telemetry.Start();
     return;
   }
   activity_registered = true;
@@ -1286,7 +826,7 @@ static void ProfilerStart() {
 
   std::printf("\n--- Live GPU telemetry ---\n");
 
-  StartGpuMetricsSampling();
+  telemetry.Start();
 }
 
 /* ------------------------------------------------ */
@@ -1330,11 +870,11 @@ static void WriteCaptureSummary(uint64_t kernel_count, double exit_write_cpu_ms,
           << late_activity_records.load(std::memory_order_relaxed) << '\n'
           << "activity_buffers_beyond_pool="
           << activity_pool_misses.load(std::memory_order_relaxed) << '\n'
-          << "telemetry_rows=" << telemetry_rows << '\n'
-          << "power_sample_rows=" << power_sample_rows << '\n'
+          << "telemetry_rows=" << telemetry.rows() << '\n'
+          << "power_sample_rows=" << telemetry.power_sample_rows() << '\n'
           << "kernel_journal=" << journal_state << '\n'
           << std::fixed << std::setprecision(3)
-          << "telemetry_thread_cpu_ms=" << telemetry_thread_cpu_ms << '\n'
+          << "telemetry_thread_cpu_ms=" << telemetry.thread_cpu_ms() << '\n'
           << "activity_thread_cpu_ms=" << activity_thread_cpu_ms << '\n'
           << "exit_write_cpu_ms=" << exit_write_cpu_ms << '\n'
           << "exit_write_wall_ms=" << exit_write_wall_ms << '\n'
@@ -1375,7 +915,7 @@ static void ProfilerStop() {
   ReleaseActivityBufferPool();
 
   /* Keep real power samples beyond the last kernel for a full final window. */
-  if (metrics_thread != nullptr && tail_duration.count() > 0) {
+  if (telemetry.sampling() && tail_duration.count() > 0) {
     const auto tail_start = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(tail_duration);
     tail_wait_ms = std::chrono::duration<double, std::milli>(
@@ -1383,16 +923,10 @@ static void ProfilerStop() {
                        .count();
   }
 
-  StopGpuMetricsSampling();
+  telemetry.Stop();
+  if (telemetry.failed()) profiler_failed = true;
 
-  if (telemetry_file.is_open() &&
-      !FinishCsvFile(&telemetry_file, TelemetryPath())) {
-    profiler_failed = true;
-  }
-  if (power_samples_file.is_open() &&
-      !FinishCsvFile(&power_samples_file, PowerSamplesPath())) {
-    profiler_failed = true;
-  }
+  if (!telemetry.FinishFiles()) profiler_failed = true;
 
   std::sort(memcpy_events.begin(), memcpy_events.end(),
             [](const MemcpyEvent& left, const MemcpyEvent& right) {
@@ -1429,7 +963,7 @@ static void ProfilerStop() {
     }
   }
 
-  const uint64_t memory_bytes = GetProcessMemory(getpid());
+  const uint64_t memory_bytes = telemetry.ProcessMemory(getpid());
 
   WriteCaptureSummary(kernel_count, exit_write_cpu_ms, exit_write_wall_ms);
 
@@ -1501,7 +1035,7 @@ static void ProfilerStop() {
 
   std::printf("D2D: %.2f MB\n", bytes_d2d / (1024.0 * 1024.0));
 
-  if (nvml_initialized) nvmlShutdown();
+  telemetry.Shutdown();
 
   std::printf("=======================\n");
 

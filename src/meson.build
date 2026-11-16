@@ -23,6 +23,14 @@ libefimon = shared_library('efimon' ,
 libefimon_dep = declare_dependency(link_with: libefimon)
 
 # -----------------------------------------------------------------------------
+# NVIDIA GPU process metrics
+# -----------------------------------------------------------------------------
+
+if enable_nvidia_gpu
+  subdir('efimon/gpu/nvidia-gpu')
+endif
+
+# -----------------------------------------------------------------------------
 # Tools compilation
 # -----------------------------------------------------------------------------
 

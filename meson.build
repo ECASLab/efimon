@@ -151,6 +151,14 @@ else
   warning('Capstone or ptrace not found. It will disable the ptrace-capstone ASM support')
 endif
 
+# Enable the NVIDIA GPU process metrics
+enable_nvidia_gpu = get_option('enable-nvidia-gpu')
+if enable_nvidia_gpu
+  message('NVIDIA GPU process metrics enabled')
+else
+  message('NVIDIA GPU process metrics disabled')
+endif
+
 project_deps += dependency('threads')
 
 # -----------------------------------------------------------------------------

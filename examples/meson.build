@@ -160,3 +160,16 @@ if enable_ptrace_capstone
             install : false,
   )
 endif
+
+if enable_nvidia_gpu
+  kernel_journal_testing = executable('kernel-journal-testing',
+            [
+              kernel_journal_sources,
+              files('kernel-journal-testing.cpp')
+            ],
+            cpp_args : cpp_args,
+            include_directories : [project_inc],
+            install : false,
+  )
+  test('kernel-journal', kernel_journal_testing)
+endif
